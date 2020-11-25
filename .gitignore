@@ -1,0 +1,17 @@
+README.txt
+prefs.db
+crash.log
+backups/
+User 1/collection.anki2
+User 1/collection.log
+User 1/collection.log.old
+User 1/collection.media.db2
+User 1/collection.media/
+User 1/collection2.log
+User 1/dbs/all.db
+User 1/dbs/known.db
+User 1/dbs/mature.db
+User 1/dbs/seen.db
+User 1/deleted.txt
+User 1/morphman.log
+User 1/morphman.stats
