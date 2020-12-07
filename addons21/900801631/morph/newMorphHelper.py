@@ -4,6 +4,7 @@ import codecs
 import aqt.main
 
 from anki import sched, schedv2
+from anki import hooks
 from anki.hooks import wrap
 from anki.lang import _
 from aqt import reviewer, dialogs
@@ -12,7 +13,7 @@ import re
 from aqt.utils import tooltip
 
 from . import main
-from .util import mw, addHook, allDb
+from .util import mw, allDb
 from .preferences import get_preference as cfg
 
 assert isinstance(mw, aqt.main.AnkiQt)
@@ -36,7 +37,7 @@ def focus(n): return n[focusName()]
 
 
 ########## 6 parent deck pulls new cards from all children instead of sequentially (ie. mostly first)
-def my_fillNew(self, recursing, _old):
+def my_fillNew(self, recursing=False, _old=None):
     """If 'new card merged fill' is enabled for the current deck, when we refill we
     pull from all child decks, sort combined pool of cards, then limit.
     If disabled, do the standard sequential fill method"""
@@ -130,15 +131,13 @@ def my_getNewCard(self, _old):
         is_fresh_vocab = note.hasTag(cfg('Tag_Fresh'))
         is_already_known = note.hasTag(cfg('Tag_AlreadyKnown'))
 
-        no_cards_learned_yet = mw.col.db.scalar('select count() from cards where nid = :nid and queue > 0', nid=note.id) == 0
-
         skip_comprehension = cfg('Option_SkipComprehensionCards')
         skip_fresh = cfg('Option_SkipFreshVocabCards')
         skip_focus_morph_seen_today = cfg('Option_SkipFocusMorphSeenToday')
 
         skip_conditions = [
             is_comprehension_card and skip_comprehension,
-            is_fresh_vocab and skip_fresh and no_cards_learned_yet,
+            is_fresh_vocab and skip_fresh,
             is_already_known,  # the user requested that the vocabulary does not have to be shown
             focus_morph in seenMorphs and skip_focus_morph_seen_today,  # we already learned that/saw that today
         ]
@@ -224,10 +223,16 @@ reviewer.Reviewer._shortcutKeys = my_reviewer_shortcutKeys
 
 
 ########## 4 - highlight morphemes using morphHighlight
-def highlight(txt, extra, fieldDict, field, mod_field):
+
+def highlight(txt: str, field, filter: str, ctx) -> str:
     """When a field is marked with the 'focusMorph' command, we format it by
     wrapping all the morphemes in <span>s with attributes set to its maturity"""
-    from .util import getFilterByTagsAndType
+
+    print("morphHighlight filter %s" % filter)
+    if filter != "morphHighlight":
+        return txt
+
+    from .util import getFilter
     from .morphemizer import getMorphemizerByName
     from .morphemes import getMorphemes
 
@@ -245,9 +250,10 @@ def highlight(txt, extra, fieldDict, field, mod_field):
         frequency_list = []
 
     priority_db = main.MorphDb(cfg('path_priority'), ignoreErrors=True).db
-    tags = fieldDict['Tags'].split()
 
-    filter = getFilterByTagsAndType(fieldDict['Type'], tags)
+    note = ctx.note()
+    tags = note.stringTags()
+    filter = getFilter(note)
     if filter is None:
         return txt
     morphemizer = getMorphemizerByName(filter['Morphemizer'])
@@ -287,7 +293,4 @@ def highlight(txt, extra, fieldDict, field, mod_field):
         txt = nonSpanSub('(%s)' % m.inflected, repl, txt)
     return txt
 
-
-# note: fmod stands for "field modifier" which look like this: {{field:modifier}}, when a card with a given modifier
-# is shown, a hook corresponding to the modifier will be run.
-addHook('fmod_morphHighlight', highlight)
+hooks.field_filter.append(highlight)

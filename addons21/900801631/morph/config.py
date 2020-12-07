@@ -52,23 +52,22 @@ default = {
     # whether to load existing all.db when recalculating or create one from scratch
     'loadAllDb': True,
     'saveDbs': True,     # whether to save all.db, known.db, mature.db, and seen.db
-
+    'saveSQLite': False,  # save the data also in an sqlite database
     # only these can have model overrides
     # whether to modify card Due times based on MorphManIndex. does nothing if relevant notes aren't enabled
     'set due based on mmi': True,
     'ignore maturity': False,        # if True, pretends card maturity is always zero
-
     # try playing fields in this order when using batch media player
     'batch media fields': ['Video', 'Sound'],
 
     # configure morph man index algorithm
-    'min good sentence length': 5,
+    'min good sentence length': 2,
     # +1000 MMI per morpheme outside the "good" length range
-    'max good sentence length': 15,
+    'max good sentence length': 30,
     # -reinforce_weight / maturity MMI per known that is not yet mature
     'reinforce new vocab weight': 5.0,
     # -verb_bonus if at least one unknown is a verb
-    'verb bonus': 100,
+    'verb bonus': 0,
 
     # -priority_weight per unknown that exists in priority.db
     'priority.db weight': 200,
@@ -81,7 +80,7 @@ default = {
     # Maximum bonus a card can get by its position in frequency.txt.
     # A card with an unknown morph that matches the first word in frequency.txt will get all this bonus.
     # A card with an unknown morph that matches some of the last words in frequency.txt will get almost no bonus.
-    'frequency.txt bonus': 10000,
+    'frequency.txt bonus': 100000,
 
     # lite update
     # this reduces how many notes are changed and thus sync burden by not updating notes that aren't as important

@@ -1,5 +1,3 @@
-<strong>NOTE: This repository has been merged back into kaegi's fork of Morphman. For the latest Morphman updates, go [here](https://github.com/kaegi/MorphMan).</strong>
-
 # MorphMan
 
 <a title="Rate on AnkiWeb" href="https://ankiweb.net/shared/info/900801631"><img src="https://glutanimate.com/logos/ankiweb-rate.svg"></a>
@@ -40,13 +38,13 @@ See the [MorphMan wiki](https://github.com/kaegi/MorphMan/wiki) for more informa
 
 # Development
 - Set up local environment:
-  - the best is to use a python virtual environment
-  - pip install pylint
-  - pip install PyQt5
-  - install Anki source code, for example:
-      - wget https://github.com/dae/anki/archive/2.1.16.tar.gz
-      - tar -xzvf 2.1.16.tar.gz
-      - export PYTHONPATH=./anki-2.1.16
+  - The best is to use a Python virtual environment and install prebuilt Anki wheels:
+    ```
+    python -m virtualenv pyenv
+    source pyenv/bin/activate
+    python -m pip install aqt==2.1.35 anki==2.1.35 pyqtwebengine pylint
+    export PYTHONPATH=./
+    ```
 - Run tests: `python test.py`
 - Build Qt Developer UI with `python scripts/build_ui.py`
 - Install git commit hook to run tests and pylint

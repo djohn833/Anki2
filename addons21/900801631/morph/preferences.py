@@ -2,8 +2,21 @@
 import importlib
 from aqt import mw
 
+# retrieving the configuration using get_config is very expensive operation
+# instead, save it 
+config_data = None
+config_py = None
 
 def init_preferences():
+    '''Called when new profiles are loaded'''
+
+    # Reset the cached configs.
+    global config_data, config_py
+
+    config_data = None
+    config_py = None
+
+    # Init
     _init_config_py()
     _init_anki_json_config()
 
@@ -15,15 +28,29 @@ def get_preference(key, model_id=None, deck_id=None):
         return _get_anki_json_config(key)
 
 
+def get_preferences():
+    assert mw.col, 'Tried to use preferences with no collection loaded'
+    addons_config = mw.col.get_config('addons')
+    if addons_config == None or 'morphman' not in addons_config:
+        # No config yet in the the collection.
+        prefs = {}
+    else:
+        prefs = addons_config['morphman']
+    return prefs
+
+
 def update_preferences(jcfg):
-    pref_copy = mw.col.conf['addons']['morphman'].copy()
-    pref_copy.update(jcfg)
-    if not mw.col.conf['addons']['morphman'] == pref_copy:
-        mw.col.conf['addons']['morphman'] = pref_copy
-        mw.col.setMod()
+    curr_config = _jsonConfig()
+    old_config = curr_config.copy()
 
-
-config_py = None
+    curr_config.update(jcfg)
+    
+    if not curr_config == old_config:
+        addons_config = mw.col.get_config('addons')
+        if addons_config is None:
+            addons_config = {}
+        addons_config['morphman'] = curr_config.copy()
+        mw.col.set_config('addons', addons_config)
 
 
 def _init_config_py():
@@ -52,10 +79,6 @@ def _get_config_py_preference(key, modelId=None, deckId=None):
 
 
 def _init_anki_json_config():
-    mw.col.conf.setdefault(
-        'addons', {}).setdefault(
-        'morphman', jcfg_default())
-
     # this ensures forward compatibility, because it adds new options in configuration without any notice
     _add_missing_json_config()
 
@@ -88,9 +111,9 @@ def jcfg_default():
         'Filter': [
             # note type (None means all note types), list of tags, list of morph fields for this note type -> morphemizer, analyze only or modify?
             {'Type': 'SubtitleMemorize', 'TypeId': None, 'Tags': ['japanese'], 'Fields': ['Expression'],
-             'Morphemizer': 'MecabMorphemizer', 'Modify': True},
+             'Morphemizer': 'MecabMorphemizer', 'Read': True, 'Modify': True},
             {'Type': 'SubtitleMemorize', 'TypeId': None, 'Tags': [], 'Fields': ['Expression'],
-             'Morphemizer': 'SpaceMorphemizer', 'Modify': True},
+             'Morphemizer': 'SpaceMorphemizer', 'Read': True, 'Modify': True},
         ],
 
         # This field lets you dictate string-to-morpheme conversions. This is useful for cases
@@ -126,6 +149,8 @@ def jcfg_default():
         # bury/skip all new cards that have a focus morph that was reviewed today/marked as `already known`
         'Option_IgnoreBracketContents': False,
         'Option_IgnoreRoundBracketContents': False,
+        'Option_IgnoreSlimRoundBracketContents': False,
+        'Option_IgnoreSuspendedLeeches': False,
         'Option_ProperNounsAlreadyKnown': False,
         
         # Readability Analyzer options
@@ -133,17 +158,22 @@ def jcfg_default():
         'Option_MasterFrequencyListPath': '',
         'Option_DefaultMinimumMasterFrequency': 0,
         'Option_DefaultStudyTarget': 98.0,
-        'Option_FillAllMorphsInStudyPlan': False,
+        'Option_SaveWordReport': False,
+        'Option_SaveReadabilityDB': False,
+        'Option_SaveStudyPlan': False,
+        'Option_SaveFrequencyList': False,
+        'Option_GroupByDir': False,
+        'Option_ProcessLines': False,
+        'Option_FillAllMorphsInStudyPlan': True,
         'Option_SourceScorePower': 2.0,            # Morpheme score formula parameter.
         'Option_SourceScoreMultiplier': 60.0,      # Morpheme score formula parameter.
     }
 
-
 def _jsonConfig():
-    conf = mw.col.conf['addons']['morphman']
-    assert conf, 'Tried to use jcfgMods before profile loaded'
-    return conf
-
+    global config_data 
+    if config_data is None:
+        config_data = get_preferences()
+    return config_data
 
 def _get_anki_json_config(key):
     return _jsonConfig().get(key)

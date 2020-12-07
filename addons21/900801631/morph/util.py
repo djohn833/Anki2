@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import codecs
 import datetime
-
+from os import path
 
 from anki.hooks import addHook
 from anki.notes import Note
@@ -27,11 +27,16 @@ except ImportError:
 _allDb = None
 
 
-def allDb(reload=False):
+def allDb():
     global _allDb
+
+    # Force reload if all.db got deleted
+    all_db_path = get_preference('path_all')
+    reload = not path.isfile(all_db_path)
+
     if reload or (_allDb is None):
         from .morphemes import MorphDb
-        _allDb = MorphDb(get_preference('path_all'), ignoreErrors=True)
+        _allDb = MorphDb(all_db_path, ignoreErrors=True)
     return _allDb
 
 
@@ -57,13 +62,36 @@ def getFilterByMidAndTags(mid, tags):
 def getFilterByTagsAndType(type, tags):
     # type: (str, List[str]) -> Optional[Dict[...]]
     for f in get_preference('Filter'):
-        if f['Type'] is None or type != f['Type']:
+        if type != f['Type'] and f['Type'] is not None: # None means all note types are ok
             continue
         if not set(f['Tags']) <= set(tags):
             continue  # required tags have to be subset of actual tags
         return f
     return None
 
+def getReadEnabledModels():
+    included_types = set()
+    include_all = False
+    for f in get_preference('Filter'):
+        if f.get('Read', True):
+            if f['Type'] is not None:
+                included_types.add(f['Type'])
+            else:
+                include_all = True
+                break
+    return included_types, include_all
+
+def getModifyEnabledModels():
+    included_types = set()
+    include_all = False
+    for f in get_preference('Filter'):
+        if f.get('Modify', True):
+            if f['Type'] is not None:
+                included_types.add(f['Type'])
+            else:
+                include_all = True
+                break
+    return included_types, include_all
 
 ###############################################################################
 # Fact browser utils

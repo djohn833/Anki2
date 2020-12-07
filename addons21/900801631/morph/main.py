@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-import codecs
+import csv
 import importlib
+import io
 import time
 import itertools
 
@@ -16,8 +17,8 @@ from . import stats
 from . import util
 from .morphemes import MorphDb, AnkiDeck, getMorphemes
 from .morphemizer import getMorphemizerByName
-from .util import printf, mw, errorMsg, getFilter, getFilterByMidAndTags
-from .preferences import get_preference as cfg
+from .util import printf, mw, errorMsg, getFilterByMidAndTags, getReadEnabledModels, getModifyEnabledModels
+from .preferences import get_preference as cfg, get_preferences
 from .util_external import memoize
 
 # hack: typing is compile time anyway, so, nothing bad happens if it fails, the try is to support anki < 2.1.16
@@ -26,6 +27,15 @@ try:
     from typing import Dict, Set
 except ImportError:
     pass
+
+# not all anki verions have profiling features
+doProfile = False
+try:
+    import cProfile, pstats
+    from pstats import SortKey
+except:
+    pass
+
 
 # only for jedi-auto-completion
 assert isinstance(mw, aqt.main.AnkiQt)
@@ -71,95 +81,142 @@ def setField(mid, fs, k, v):  # nop if field DNE
     if idx:
         fs[idx] = v
 
+def notesToUpdate(last_updated, included_mids):
+    # returns list of (nid, mid, flds, guid, tags, maxmat) of
+    # cards to analyze
+    # ignoring cards that are leeches
+    # 
+    # leeches are cards have tag "Leech". Anki guarantees a space before and after
+    #
+    # the logic of the query is:
+    #   include cards in the result that are
+    #     non-suspended
+    #      or
+    #     are suspended and are not Leeches
+    #
+    # we build a predicate that we append to the where clause
+    if cfg('Option_IgnoreSuspendedLeeches'):
+        filterSuspLeeches = "(c.queue <> -1 or (c.queue = -1 and not instr(tags, ' leech ')))"
+    else:
+        filterSuspLeeches = "TRUE"
+
+    #
+    # First find the cards to analyze
+    #   then find the max maturity of those cards
+    query = '''
+        WITH notesToUpdate as (
+            SELECT distinct n.id AS nid, mid, flds, guid, tags
+            FROM notes n JOIN cards c ON (n.id = c.nid)
+            WHERE mid IN ({0}) and (n.mod > {1} or c.mod > {1})
+               and {2}) -- ignoring suspended leeches
+        SELECT nid, mid, flds, guid, tags,
+            max(case when ivl=0 and c.type=1 then 0.5 else ivl end) AS maxmat
+        FROM notesToUpdate join cards c USING (nid)
+        WHERE {2} -- ignoring suspended leeches
+        GROUP by nid, mid, flds, guid, tags;
+        '''.format(','.join([str(m) for m in included_mids]), last_updated, filterSuspLeeches)
+
+    return mw.col.db.execute(query)
 
 def mkAllDb(all_db=None):
     from . import config
     importlib.reload(config)
     t_0, db, TAG = time.time(), mw.col.db, mw.col.tags
-    N_notes = db.scalar('select count() from notes')
+    mw.progress.start(label='Prep work for all.db creation',
+                      immediate=True)
     # for providing an error message if there is no note that is used for processing
     N_enabled_notes = 0
-    mw.progress.start(label='Prep work for all.db creation',
-                      max=N_notes, immediate=True)
+
 
     if not all_db:
         all_db = MorphDb()
+
+    # Recompute everything if preferences changed.
+    last_preferences = all_db.meta.get('last_preferences', {})
+    if not last_preferences == get_preferences():
+        print("Preferences changed.  Recomputing all_db...")
+        all_db = MorphDb() # Clear all db
+        last_updated = 0
+    else:
+        last_updated = all_db.meta.get('last_updated', 0)
+
     fidDb = all_db.fidDb()
     locDb = all_db.locDb(recalc=False)  # fidDb() already forces locDb recalc
 
-    mw.progress.update(label='Generating all.db data')
-    for i, (nid, mid, flds, guid, tags) in enumerate(db.execute('select id, mid, flds, guid, tags from notes')):
+    included_types, include_all = getReadEnabledModels()
+    included_mids = [m['id'] for m in mw.col.models.all() if include_all or m['name'] in included_types]
+
+    notes = notesToUpdate(last_updated, included_mids)
+    N_notes = len(notes)
+
+    mw.progress.finish()
+    mw.progress.start(label='Generating all.db data',
+                      max=N_notes,
+                      immediate=True)
+
+    for i, (nid, mid, flds, guid, tags, maxmat) in enumerate(notes):
+
         if i % 500 == 0:
             mw.progress.update(value=i)
 
-        C = partial(cfg, model_id=mid)
-
-        note = mw.col.getNote(nid)
-        note_cfg = getFilter(note)
-        if note_cfg is None:
+        ts = TAG.split(tags)
+        mid_cfg = getFilterByMidAndTags(mid, ts)
+        if mid_cfg is None:
             continue
-        morphemizer = getMorphemizerByName(note_cfg['Morphemizer'])
 
         N_enabled_notes += 1
 
-        mats = [(0.5 if ivl == 0 and ctype == 1 else ivl) for ivl, ctype in
-                db.execute('select ivl, type from cards where nid = :nid', nid=nid)]
+        mName = mid_cfg['Morphemizer']
+        morphemizer = getMorphemizerByName(mName)
+
+        C = partial(cfg, model_id=mid)
+
         if C('ignore maturity'):
-            mats = [0] * len(mats)
+            maxmat = 0
         ts, alreadyKnownTag = TAG.split(tags), cfg('Tag_AlreadyKnown')
         if alreadyKnownTag in ts:
-            mats += [C('threshold_mature') + 1]
+            maxmat = max(maxmat, C('threshold_mature') + 1)
 
-        for fieldName in note_cfg['Fields']:
+        for fieldName in mid_cfg['Fields']:
             try:  # if doesn't have field, continue
                 fieldValue = extractFieldData(fieldName, flds, mid)
             except KeyError:
                 continue
             except TypeError:
                 mname = mw.col.models.get(mid)['name']
-                errorMsg('Failed to get field "{field}" from a note of model "{model}". Please fix your config.py '
-                         'file to match your collection appropriately and ignore the following error.'.format(
+                errorMsg('Failed to get field "{field}" from a note of model "{model}". Please fix your Note Filters '
+                         'under MorphMan > Preferences to match your collection appropriately.'.format(
                              model=mname, field=fieldName))
-                raise
+                return
+            assert maxmat!=None, "Maxmat should not be None"
 
             loc = fidDb.get((nid, guid, fieldName), None)
             if not loc:
-                loc = AnkiDeck(nid, fieldName, fieldValue, guid, mats)
+                loc = AnkiDeck(nid, fieldName, fieldValue, guid, maxmat)
                 ms = getMorphemes(morphemizer, fieldValue, ts)
                 if ms:  # TODO: this needed? should we change below too then?
                     locDb[loc] = ms
             else:
                 # mats changed -> new loc (new mats), move morphs
-                if loc.fieldValue == fieldValue and loc.maturities != mats:
-                    newLoc = AnkiDeck(nid, fieldName, fieldValue, guid, mats)
+                if loc.fieldValue == fieldValue and loc.maturity != maxmat:
+                    newLoc = AnkiDeck(nid, fieldName, fieldValue, guid, maxmat)
                     locDb[newLoc] = locDb.pop(loc)
                 # field changed -> new loc, new morphs
                 elif loc.fieldValue != fieldValue:
-                    newLoc = AnkiDeck(nid, fieldName, fieldValue, guid, mats)
+                    newLoc = AnkiDeck(nid, fieldName, fieldValue, guid, maxmat)
                     ms = getMorphemes(morphemizer, fieldValue, ts)
                     locDb.pop(loc)
                     locDb[newLoc] = ms
-        if i % 100 == 0:
-            mw.progress.update(value=i, label='Creating all.db objects')
 
-    if N_enabled_notes == 0:
-        mw.progress.finish()
-        errorMsg('There is no card that can be analyzed or be moved. Add cards or (re-)check your configuration under '
-                 '"Tools -> MorhpMan Preferences" or in "Anki/addons/morph/config.py" for mistakes.')
-        return None
+    printf('Processed %d notes in %f sec' % (N_notes, time.time() - t_0))
 
-    printf('Processed all %d notes in %f sec' % (N_notes, time.time() - t_0))
-
+    mw.progress.update(label='Creating all.db objects')
+    old_meta = all_db.meta
     all_db.clear()
     all_db.addFromLocDb(locDb)
-    if cfg('saveDbs'):
-        mw.progress.update(label='Saving all.db to disk')
-        all_db.save(cfg('path_all'))
-        printf('Processed all %d notes + saved all.db in %f sec' %
-               (N_notes, time.time() - t_0))
+    all_db.meta = old_meta
     mw.progress.finish()
     return all_db
-
 
 def filterDbByMat(db, mat):
     """Assumes safe to use cached locDb"""
@@ -175,8 +232,7 @@ def updateNotes(allDb):
 
     TAG = mw.col.tags  # type: TagManager
     ds, nid2mmi = [], {}
-    N_notes = db.scalar('select count() from notes')
-    mw.progress.start(label='Updating data', max=N_notes, immediate=True)
+    mw.progress.start(label='Updating data', immediate=True)
     fidDb = allDb.fidDb(recalc=True)
     loc_db = allDb.locDb(recalc=False)  # type: Dict[Location, Set[Morpheme]]
 
@@ -193,28 +249,30 @@ def updateNotes(allDb):
     knownDb = filterDbByMat(allDb, cfg('threshold_known'))
     matureDb = filterDbByMat(allDb, cfg('threshold_mature'))
     mw.progress.update(label='Loading priority.db')
-    priorityDb = MorphDb(cfg('path_priority'), ignoreErrors=True).db
+    priorityDb = MorphDb(cfg('path_priority'), ignoreErrors=True)
 
     mw.progress.update(label='Loading frequency.txt')
     frequencyListPath = cfg('path_frequency')
+    frequency_map = {}
+    frequency_has_morphemes = False
+
     try:
-        with codecs.open(frequencyListPath, encoding='utf-8') as f:
-            # create a dictionary. key is word, value is its position in the file
-            frequency_list = dict(zip(
-                [line.strip().split('\t')[0] for line in f.readlines()],
-                itertools.count(0)))
+        with io.open(frequencyListPath, encoding='utf-8-sig') as csvfile:
+            csvreader = csv.reader(csvfile, delimiter="\t")
+            rows = [row for row in csvreader]
+
+            if rows[0][0] == "#study_plan_frequency":
+                frequency_has_morphemes = True
+                frequency_map = dict(
+                    zip([Morpheme(row[0], row[1], row[2], row[3], row[4], row[5]) for row in rows[1:]],
+                        itertools.count(0)))
+            else:
+                frequency_map = dict(zip([row[0] for row in rows], itertools.count(0)))
+
     except FileNotFoundError:
-        frequency_list = dict()
+        pass
 
-    frequencyListLength = len(frequency_list)
-
-    if cfg('saveDbs'):
-        mw.progress.update(label='Saving seen/known/mature dbs')
-        seenDb.save(cfg('path_seen'))
-        knownDb.save(cfg('path_known'))
-        matureDb.save(cfg('path_mature'))
-
-    mw.progress.update(label='Updating notes')
+    frequencyListLength = len(frequency_map)
 
     # prefetch cfg for fields
     field_focus_morph = cfg('Field_FocusMorph')
@@ -226,7 +284,59 @@ def updateNotes(allDb):
     field_unknown_freq = cfg('Field_UnknownFreq')
     field_focus_morph_pos = cfg("Field_FocusMorphPos")
 
-    for i, (nid, mid, flds, guid, tags) in enumerate(db.execute('select id, mid, flds, guid, tags from notes')):
+    skip_comprehension_cards = cfg('Option_SkipComprehensionCards')
+    skip_fresh_cards = cfg('Option_SkipFreshVocabCards')
+    
+    # Find all morphs that changed maturity and the notes that refer to them.
+    last_maturities = allDb.meta.get('last_maturities', {})
+    new_maturities = {}
+    refresh_notes = set()
+
+    # Recompute everything if preferences changed.
+    last_preferences = allDb.meta.get('last_preferences', {})
+    if not last_preferences == get_preferences():
+        print("Preferences changed.  Updating all notes...")
+        last_updated = 0
+    else:
+        last_updated = allDb.meta.get('last_updated', 0)
+
+    # Todo: Remove this forced 0 once we add checks for other changes like new frequency.txt files.
+    last_updated = 0
+
+    # If we're updating everything anyway, clear the notes set.
+    if last_updated > 0:
+        for m, locs in allDb.db.items():
+            maturity_bits = 0
+            if seenDb.matches(m):
+                maturity_bits |= 1
+            if knownDb.matches(m):
+                maturity_bits |= 2
+            if matureDb.matches(m):
+                maturity_bits |= 4
+
+            new_maturities[m] = maturity_bits
+
+            if last_maturities.get(m, -1) != maturity_bits:
+                for loc in locs:
+                    if isinstance(loc, AnkiDeck):
+                        refresh_notes.add(loc.noteId)
+
+    included_types, include_all = getModifyEnabledModels()
+    included_mids = [m['id'] for m in mw.col.models.all() if include_all or m['name'] in included_types]
+
+    query = '''
+        select id, mid, flds, guid, tags from notes
+        WHERE mid IN ({0}) and ( mod > {2} or id in ({1}) )
+        '''.format(','.join([str(m) for m in included_mids]), ','.join([str(id) for id in refresh_notes]), last_updated)
+    query_results = db.execute(query)
+
+    N_notes = len(query_results)
+    mw.progress.finish()
+    mw.progress.start(label='Updating notes',
+                      max=N_notes,
+                      immediate=True)
+
+    for i, (nid, mid, flds, guid, tags) in enumerate(query_results):
         ts = TAG.split(tags)
         if i % 500 == 0:
             mw.progress.update(value=i)
@@ -281,19 +391,23 @@ def updateNotes(allDb):
         usefulness = 0
         for focusMorph in unknowns:
             F_k += allDb.frequency(focusMorph)
-            if focusMorph in priorityDb:
+
+            if priorityDb.frequency(focusMorph) > 0:
                 isPriority = True
                 usefulness += C('priority.db weight')
-            focusMorphString = focusMorph.base
-            try:
-                focusMorphIndex = frequency_list[focusMorphString]
+
+            deinfFocusMorph = focusMorph.deinflected()
+            
+            if frequency_has_morphemes:
+                focusMorphIndex = frequency_map.get(deinfFocusMorph, -1)
+            else:
+                focusMorphIndex = frequency_map.get(deinfFocusMorph.base, -1)
+
+            if focusMorphIndex >= 0:
                 isFrequency = True
 
                 # The bigger this number, the lower mmi becomes
                 usefulness += int(round( frequencyBonus * (1 - focusMorphIndex / frequencyListLength) ))
-
-            except KeyError:
-                pass
 
         # average frequency of unknowns (ie. how common the word is within your collection)
         F_k_avg = F_k // N_k if N_k > 0 else F_k
@@ -317,11 +431,6 @@ def updateNotes(allDb):
                          max(0, N - C('max good sentence length')))
         lenDiff = min(9, abs(lenDiffRaw))
 
-        # calculate mmi
-        mmi = 100000 * N_k + 1000 * lenDiff + int(round(usefulness))
-        if C('set due based on mmi'):
-            nid2mmi[nid] = mmi
-
         # Fill in various fields/tags on the note based on cfg
         fs = splitFields(flds)
 
@@ -332,6 +441,8 @@ def updateNotes(allDb):
         # determine card type
         if N_m == 0:  # sentence comprehension card, m+0
             ts.append(compTag)
+            if skip_comprehension_cards:
+                usefulness += 1000000 # Add a penalty to put these cards at the end of the queue
         elif N_k == 1:  # new vocab card, k+1
             ts.append(vocabTag)
             setField(mid, fs, field_focus_morph, focusMorph.base)
@@ -340,13 +451,22 @@ def updateNotes(allDb):
             ts.append(notReadyTag)
         elif N_m == 1:  # we have k+0, and m+1, so this card does not introduce a new vocabulary -> card for newly learned morpheme
             ts.append(freshTag)
+            if skip_fresh_cards:
+                usefulness += 1000000 # Add a penalty to put these cards at the end of the queue
             focusMorph = next(iter(unmatures))
             setField(mid, fs, field_focus_morph, focusMorph.base)
             setField(mid, fs, field_focus_morph_pos, focusMorph.pos)
 
         else:  # only case left: we have k+0, but m+2 or higher, so this card does not introduce a new vocabulary -> card for newly learned morpheme
             ts.append(freshTag)
+            if skip_fresh_cards:
+                usefulness += 1000000 # Add a penalty to put these cards at the end of the queue
 
+        # calculate mmi
+        mmi = 100000 * N_k + 1000 * lenDiff + int(round(usefulness))
+        if C('set due based on mmi'):
+            nid2mmi[nid] = mmi
+            
         # set type agnostic fields
         setField(mid, fs, field_unknown_count, '%d' % N_k)
         setField(mid, fs, field_unmature_count, '%d' % N_m)
@@ -415,18 +535,38 @@ def updateNotes(allDb):
 
     mw.col.db.executemany(
         'update cards set due=?, mod=?, usn=? where id=?', ds)
+
     mw.reset()
 
-    printf('Updated notes in %f sec' % (time.time() - t_0))
+    allDb.meta['last_preferences'] = get_preferences()
+    allDb.meta['last_maturities'] = new_maturities
+    allDb.meta['last_updated'] = int(time.time() + 0.5)
+
+    printf('Updated %d notes in %f sec' % (N_notes, time.time() - t_0))
+
+    if cfg('saveDbs'):
+        mw.progress.update(label='Saving all/seen/known/mature dbs')
+        allDb.save(cfg('path_all'))
+        seenDb.save(cfg('path_seen'))
+        knownDb.save(cfg('path_known'))
+        matureDb.save(cfg('path_mature'))
+        printf('Updated %d notes + saved dbs in %f sec' % (N_notes, time.time() - t_0))
+
     mw.progress.finish()
     return knownDb
 
 
 def main():
+    # begin-------------------
+    global doProfile
+    if doProfile:
+        pr = cProfile.Profile()
+        pr.enable()
+
     # load existing all.db
     mw.progress.start(label='Loading existing all.db', immediate=True)
     t_0 = time.time()
-    cur = util.allDb(reload=True) if cfg('loadAllDb') else None
+    cur = util.allDb() if cfg('loadAllDb') else None
     printf('Loaded all.db in %f sec' % (time.time() - t_0))
     mw.progress.finish()
 
@@ -452,3 +592,12 @@ def main():
 
     # set global allDb
     util._allDb = allDb
+
+    # finish-------------------
+    if doProfile:
+        pr.disable()
+        s = io.StringIO()
+        sortby = SortKey.CUMULATIVE
+        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+        ps.print_stats()
+        print(s.getvalue())

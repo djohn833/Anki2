@@ -42,7 +42,7 @@ class PreferencesDialog(QDialog):
         self.frame1.setLayout(vbox)
         vbox.setContentsMargins(0, 20, 0, 0)
 
-        self.tableModel = QStandardItemModel(0, 5)
+        self.tableModel = QStandardItemModel(0, 6)
         self.tableView = QTableView()
         self.tableView.setModel(self.tableModel)
         self.tableView.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -52,7 +52,8 @@ class PreferencesDialog(QDialog):
         self.tableModel.setHeaderData(1, Qt.Horizontal, "Tags")
         self.tableModel.setHeaderData(2, Qt.Horizontal, "Fields")
         self.tableModel.setHeaderData(3, Qt.Horizontal, "Morphemizer")
-        self.tableModel.setHeaderData(4, Qt.Horizontal, "Modify?")
+        self.tableModel.setHeaderData(4, Qt.Horizontal, "Read?")
+        self.tableModel.setHeaderData(5, Qt.Horizontal, "Modify?")
 
         rowData = get_preference('Filter')
         self.tableModel.setRowCount(len(rowData))
@@ -201,17 +202,25 @@ class PreferencesDialog(QDialog):
             ("Skip comprehension cards", 'Option_SkipComprehensionCards',
              'Note that only has mature words (optimal for sentence learning but not for acquiring new vocabulary).'),
             ("Skip cards with fresh vocabulary", 'Option_SkipFreshVocabCards',
-             'Note that does not contain unknown words, but one or\nmore unmature (card with recently learned morphmes). Enable to\nskip to first card that has unknown vocabulary.'),
+             "Note that does not contain unknown words, but one or more unmature (card with recently learned morphmes).\n"
+             "Enable to skip to first card that has unknown vocabulary."),
             ("Skip card if focus morph was already seen today", 'Option_SkipFocusMorphSeenToday',
-             'This improves the \'new cards\'-queue without having to recalculate the databases.'),
+             "This improves the 'new cards'-queue without having to recalculate the databases."),
+            ("Include all missing morphemes in my 'frequency list'", 'Option_FillAllMorphsInStudyPlan',
+             "When generating a study plan, by default only those morphemes that are in the plan are added to your 'frequency.txt'\n"
+             "This option includes all other morphemes at the end of the plan, so that you can study ahead."),
             ("Ignore grammar position", 'Option_IgnoreGrammarPosition',
              'Use this option to ignore morpheme grammar types (noun, verb, helper, etc.).'),
             ("Ignore everything contained within [ ] brackets", 'Option_IgnoreBracketContents',
              'Use this option to ignore content such as furigana readings and pitch.'),
-            ("Ignore everything contained within （ ） brackets", 'Option_IgnoreRoundBracketContents',
+            ("Ignore everything contained within ( ) brackets", 'Option_IgnoreSlimRoundBracketContents',
              'Use this option to ignore content such as character names and readings in scripts.'),
+            ("Ignore everything contained within （ ） brackets", 'Option_IgnoreRoundBracketContents',
+             'Use this option to ignore content such as character names and readings in Japanese scripts.'),
             ("Treat proper nouns as known", 'Option_ProperNounsAlreadyKnown',
-             'Treat proper nouns as already known when scoring cards (currently only works for Japanese).')
+             'Treat proper nouns as already known when scoring cards (currently only works for Japanese).'),
+            ('Ignore suspended leeches', 'Option_IgnoreSuspendedLeeches',
+             'Ignore cards that are suspended and have the tag \'leech\'.')
         ]
         self.boolOptionList = []
         for i, (name, key, tooltipInfo) in enumerate(optionList):
@@ -259,15 +268,20 @@ class PreferencesDialog(QDialog):
         morphemizerComboBox.setMorphemizers(getAllMorphemizers())
         morphemizerComboBox.setCurrentByName(data['Morphemizer'])
 
-        item = QStandardItem()
-        item.setCheckable(True)
-        item.setCheckState(Qt.Checked if data['Modify'] else Qt.Unchecked)
+        readItem = QStandardItem()
+        readItem.setCheckable(True)
+        readItem.setCheckState(Qt.Checked if data.get('Read', True) else Qt.Unchecked)
+
+        modifyItem = QStandardItem()
+        modifyItem.setCheckable(True)
+        modifyItem.setCheckState(Qt.Checked if data.get('Modify', True) else Qt.Unchecked)
 
         rowGui['modelComboBox'] = modelComboBox
         rowGui['tagsEntry'] = QLineEdit(', '.join(data['Tags']))
         rowGui['fieldsEntry'] = QLineEdit(', '.join(data['Fields']))
         rowGui['morphemizerComboBox'] = morphemizerComboBox
-        rowGui['modifyCheckBox'] = item
+        rowGui['readCheckBox'] = readItem
+        rowGui['modifyCheckBox'] = modifyItem
 
         def setColumn(col, widget):
             self.tableView.setIndexWidget(self.tableModel.index(rowIndex, col), widget)
@@ -276,7 +290,8 @@ class PreferencesDialog(QDialog):
         setColumn(1, rowGui['tagsEntry'])
         setColumn(2, rowGui['fieldsEntry'])
         setColumn(3, rowGui['morphemizerComboBox'])
-        self.tableModel.setItem(rowIndex, 4, item)
+        self.tableModel.setItem(rowIndex, 4, readItem)
+        self.tableModel.setItem(rowIndex, 5, modifyItem)
 
         if len(self.rowGui) == rowIndex:
             self.rowGui.append(rowGui)
@@ -300,6 +315,7 @@ class PreferencesDialog(QDialog):
             x for x in row_gui['fieldsEntry'].text().split(', ') if x]
 
         filter['Morphemizer'] = row_gui['morphemizerComboBox'].getCurrent().getName()
+        filter['Read'] = row_gui['readCheckBox'].checkState() != Qt.Unchecked
         filter['Modify'] = row_gui['modifyCheckBox'].checkState() != Qt.Unchecked
 
         return filter

@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
+import array
 import csv
 import errno
 import importlib
 import io
+import gzip
 import operator
 import os
+from pathlib import Path
+import pickle as pickle
 import re
 
 from PyQt5.QtCore import *
@@ -34,10 +38,15 @@ def natural_keys(text):
     """
     return [atoi(c) for c in re.split(r'(\d+)', text)]
 
+class NaturalKeysTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other):
+        lvalue = self.text()
+        rvalue = other.text()
+        return natural_keys(lvalue) < natural_keys(rvalue)
 
 class Source:
     def __init__(self, name, morphs, line_morphs, unknown_db):
-        self.name = os.path.basename(name)
+        self.name = name
         self.morphs = morphs
         self.line_morphs = line_morphs
         self.unknown_db = unknown_db
@@ -88,13 +97,122 @@ class CountingMorphDB:
         count = 0
         ms = self.db[gk]
         for alt, c in ms.items():
-            if c[1]:  # Skip marked morphs
+            if exclude_db != None and c[1]:  # Skip marked morphs
                 continue
-            if exclude_db.matches(alt): # Skip excluded morphs
+            if exclude_db != None and exclude_db.matches(alt): # Skip excluded morphs
                 continue
             if altIncludesMorpheme(alt, m):  # pylint: disable=W1114 #ToDo: verify if pylint is right
                 count += c[0]
         return count
+
+class LocationCorpus:
+    def __init__(self, db, save_lines=False):
+        self.version = 1.0
+        self.db = db
+        self.has_line_data = save_lines
+        if self.has_line_data:
+            self.line_data = []
+            self.morph_data = None
+        else:
+            self.line_data = None
+            self.morph_data = {}
+
+    def add_line_morphs(self, morphs):
+        if self.has_line_data:
+            morph_id_array = array.array('l', [self.db.get_morph_id(m) for m in morphs])
+            self.line_data.append(morph_id_array)
+        else:
+            for m in morphs:
+                self.add_morph(m, 1)
+
+    def add_morph(self, m, count):
+        if self.has_line_data:
+            assert False, "Expecting line data instead of single morphs"
+        else:
+            mid = self.db.get_morph_id(m)
+            self.morph_data[mid] = self.morph_data.get(mid, 0) + count
+
+    # Generator that iterates through morphs in a single line.
+    def line_morph_count_iter(self, line):
+        for mid in line:
+            yield (self.db.get_morph_from_id(mid), 1)
+
+    # Generator that iterates through all morphs.
+    def morph_count_iter(self):
+        if self.has_line_data:
+            assert False, "not expected call"
+            for line in self.line_data:
+                for m, count in self.line_morph_count_iter(line):
+                    yield (m, count)
+        else:
+            for mid, count in self.morph_data.items():
+                yield (self.db.get_morph_from_id(mid), count)
+
+    # Generator that iterates through all lines, returning a morph iterator.
+    def line_iter(self):
+        if self.has_line_data:
+            for line in self.line_data:
+                yield self.line_morph_count_iter(line)
+        else:
+            yield self.morph_count_iter()
+
+class LocationCorpusDB:
+    def __init__(self):
+        self.version = 1.0
+        self.ordered_locs = []
+        self.morph_to_id = {}
+        self.id_to_morph = {}
+        self.next_morph_id = 0
+
+    def get_or_create_corpus(self, loc_name, save_lines):
+        for loc, loc_corpus in self.ordered_locs:
+            if loc == loc_name:
+                return loc_corpus
+
+        loc_corpus = LocationCorpus(self, save_lines)
+        self.ordered_locs.append((loc_name, loc_corpus))
+        return loc_corpus
+
+    def get_morph_id(self, m):
+        mid = self.morph_to_id.get(m, -1)
+        if mid < 0:
+            mid = self.next_morph_id
+            self.next_morph_id += 1
+            self.morph_to_id[m] = mid
+            self.id_to_morph[mid] = m
+        return mid
+
+    def get_morph_from_id(self, mid):
+        return self.id_to_morph[mid]
+
+    def save(self, path):
+        par = os.path.split(path)[0]
+        if not os.path.exists(par):
+            os.makedirs(par)
+        f = gzip.open(path, 'wb')
+        data = {'db': self,
+                'meta': {}
+                }
+        pickle.dump(data, f, -1)
+        f.close()
+
+    def load(self, path, save_lines=False):
+        with gzip.open(path) as f:
+            data = pickle.load(f)
+            other_db = data['db']
+
+            for loc, loc_corpus in other_db.ordered_locs:
+                new_loc = (loc[0], os.path.basename(path))
+                new_corpus = self.get_or_create_corpus(new_loc, save_lines and loc_corpus.has_line_data)
+
+                if loc_corpus.has_line_data:
+                    for line in loc_corpus.line_data:
+                        new_corpus.add_line_morphs([other_db.get_morph_from_id(mid) for mid in line])
+                else:
+                    for mid, count in loc_corpus.morph_data.items():
+                        new_corpus.add_morph(other_db.get_morph_from_id(mid), count)
+
+            del other_db
 
 class TableInteger(QTableWidgetItem):
     def __init__(self, value):
@@ -132,6 +250,12 @@ class MorphMan(QDialog):
             lambda le: getPath(self.ui.outputFrequencyEdit, "Select Output Directory", True))
         self.ui.minFrequencySpinBox.setProperty("value", cfg('Option_DefaultMinimumMasterFrequency'))
         self.ui.targetSpinBox.setProperty("value", cfg('Option_DefaultStudyTarget'))
+        self.ui.wordReportCheckBox.setChecked(cfg('Option_SaveWordReport'))
+        self.ui.readabilityDBCheckBox.setChecked(cfg('Option_SaveReadabilityDB'))
+        self.ui.studyPlanCheckBox.setChecked(cfg('Option_SaveStudyPlan'))
+        self.ui.frequencyListCheckBox.setChecked(cfg('Option_SaveFrequencyList'))
+        self.ui.groupByDirCheckBox.setChecked(cfg('Option_GroupByDir'))
+        self.ui.processLinesCheckBox.setChecked(cfg('Option_ProcessLines'))
 
         # Connect buttons
         self.ui.analyzeButton.clicked.connect(lambda le: self.onAnalyze())
@@ -157,6 +281,35 @@ class MorphMan(QDialog):
         self.ui.outputText.moveCursor(QTextCursor.End)
         self.ui.outputText.insertPlainText(m)
 
+    def saveWordReport(self, known_db, morphs, path):
+        all_db = CountingMorphDB()
+        for m,c in morphs.items():
+            all_db.addMorph(Morpheme(m.norm, m.base, m.base, m.read, m.pos, m.subPos), c)
+
+        master_morphs = {}
+        for ms in all_db.db.values():
+            for m, c in ms.items():
+                master_morphs[m] = c[0]
+
+        with open(path, 'wt', encoding='utf-8') as f:
+            last_count = 0
+            morph_idx = 0
+            group_idx = 0
+            morph_total = 0.0
+            master_morphs_count = sum(n for n in master_morphs.values())
+
+            for m in sorted(master_morphs.items(), key=operator.itemgetter(1), reverse=True):
+                if m[1] != last_count:
+                    last_count = m[1]
+                    group_idx += 1
+                morph_idx += 1
+                morph_delta = 100.0 * m[1] / master_morphs_count
+                morph_total += morph_delta
+                print('%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%0.8f\t%0.8f matches %d' % (
+                    m[1], m[0].norm, m[0].base, m[0].read, m[0].pos, m[0].subPos, group_idx, morph_idx, morph_delta,
+                    morph_total, known_db.matches(m[0])), file=f)
+
+
     def onAnalyze(self):
         self.clearOutput()
 
@@ -169,10 +322,15 @@ class MorphMan(QDialog):
         readability_target = float(self.ui.targetSpinBox.value())
         master_freq_path = self.ui.masterFreqEdit.text()
         known_words_path = self.ui.knownMorphsEdit.text()
+        mature_words_path = os.path.normpath(os.path.dirname(known_words_path) + '/mature.db')
         output_path = self.ui.outputFrequencyEdit.text()
-        save_frequency_list = self.ui.frequencyListCheckBox.isChecked()
         save_word_report = self.ui.wordReportCheckBox.isChecked()
+        save_readability_db = self.ui.readabilityDBCheckBox.isChecked()
         save_study_plan = self.ui.studyPlanCheckBox.isChecked()
+        save_frequency_list = self.ui.frequencyListCheckBox.isChecked()
+        group_by_dir = self.ui.groupByDirCheckBox.isChecked()
+        process_lines = self.ui.processLinesCheckBox.isChecked()
+        save_missing_word_report = True
 
         # Save updated preferences
         pref = {}
@@ -180,6 +338,12 @@ class MorphMan(QDialog):
         pref['Option_MasterFrequencyListPath'] = master_freq_path
         pref['Option_DefaultMinimumMasterFrequency'] = minimum_master_frequency
         pref['Option_DefaultStudyTarget'] = readability_target
+        pref['Option_SaveWordReport'] = save_word_report
+        pref['Option_SaveReadabilityDB'] = save_readability_db
+        pref['Option_SaveStudyPlan'] = save_study_plan
+        pref['Option_SaveFrequencyList'] = save_frequency_list
+        pref['Option_GroupByDir'] = group_by_dir
+        pref['Option_ProcessLines'] = process_lines
         update_preferences(pref)
 
         source_score_power = cfg('Option_SourceScorePower')
@@ -196,18 +360,35 @@ class MorphMan(QDialog):
                     raise
 
         frequency_list_path = os.path.normpath(output_path + '/frequency.txt')
-        word_report_path = os.path.normpath(output_path + '/word_freq_report.txt')
+        instance_freq_report_path = os.path.normpath(output_path + '/instance_freq_report.txt')
+        morph_freq_report_path = os.path.normpath(output_path + '/morph_freq_report.txt')
         study_plan_path = os.path.normpath(output_path + '/study_plan.txt')
         readability_log_path = os.path.normpath(output_path + '/readability_log.txt')
+        missing_master_path = os.path.normpath(output_path + '/missing_master_word_report.txt')
+        word_reports_path = os.path.normpath(output_path + '/word_reports')
+        corpus_db_path = os.path.normpath(output_path + '/word_corpus.corpusdb')
 
         log_fp = open(readability_log_path, 'wt', encoding='utf-8')
 
+        try:
+            os.mkdir(word_reports_path)
+        except:
+            pass
+
         master_db = CountingMorphDB()
         unknown_db = CountingMorphDB()
+        corpus_db = LocationCorpusDB()
+
+        # Map from Morpheme -> morph state bitfield
+        morph_state_cache = {}
 
         master_total_instances = 0
         master_current_score = 0
 
+        # Map from Morpheme -> count of times Morpheme was parsed
+        all_morph_instances = {}
+
+        # Map from Morpheme -> count of locations the morpheme was found in
         all_morphs = {}
 
         if os.path.isfile(master_freq_path):
@@ -238,11 +419,21 @@ class MorphMan(QDialog):
             self.writeOutput("Known words DB '%s' not found\n" % known_words_path)
             known_db = MorphDb()
 
+        if os.path.isfile(mature_words_path):
+            mature_db = MorphDb(mature_words_path, ignoreErrors=True)
+
+            m_total_k = len(mature_db.groups)
+            m_total_v = len(mature_db.db)
+            self.writeOutput("Mature morphs loaded: K %d V %d\n" % (m_total_k, m_total_v))
+        else:
+            self.writeOutput("Mature words DB '%s' not found\n" % mature_words_path)
+            mature_db = MorphDb()
+
         if master_total_instances > 0:
             master_current_score = 0
             for ms in master_db.db.values():
                 for m, c in ms.items():
-                    if known_db.matches(m):
+                    if known_db.matches(m) or (proper_nouns_known and m.isProperNoun()):
                         master_current_score += c[0]
                         c[1] = True  # mark matched
             self.writeOutput("\n[Current master frequency readability] %0.02f\n" % (
@@ -250,66 +441,125 @@ class MorphMan(QDialog):
 
         sources = []
 
-        def measure_readability(file_name, is_ass, is_srt):
-            log_fp.write('measure_readability %s\n' % file_name)
-
-            proper_noun_count = 0
+        def proc_file_result(full_name, corpuses):
             i_count = 0
+            known_count = 0
+            mature_count = 0
+            proper_noun_count = 0
             line_count = 0
-            line_morphs = []
             known_line_count = 0
             iplus1_line_count = 0
-            known_count = 0
             seen_morphs = {}
-            known_morphs = {}
+            known_morphs = set()
             source_unknown_db = CountingMorphDB()
+            line_morphs = []
 
-            def proc_lines(text, is_ass, is_srt):
+            for loc_corpus in corpuses:
+                for line_iter in loc_corpus.line_iter():
+                    line_unknown_morphs = 0
+                    line_morphs_set = set()
+                    for m, count in line_iter:
+                        i_count += count
+                        collapse_morphs = True
+                        if m not in seen_morphs:
+                            all_morphs[m] = all_morphs.get(m, 0) + 1
+                        all_morph_instances[m] = all_morph_instances.get(m, 0) + count
+                        seen_morphs[m] = seen_morphs.get(m, 0) + count
+
+                        if process_lines:
+                            line_morphs_set.add(m)
+
+                        morph_state = morph_state_cache.get(m, None)
+                        if morph_state is None:
+                            morph_state = 0
+                            if m.isProperNoun():
+                                morph_state |= 1 # Proper noun bit
+                                is_proper_noun = True
+                            else:
+                                is_proper_noun = False
+
+                            if known_db.matches(m) or (proper_nouns_known and is_proper_noun):
+                                morph_state |= 2
+                            if mature_db.matches(m) or (proper_nouns_known and is_proper_noun):
+                                morph_state |= 4
+
+                            morph_state_cache[m] = morph_state
+
+                        if morph_state & 1:
+                            proper_noun_count += count
+
+                        if morph_state & 2:
+                            known_count += count
+                            known_morphs.add(m)
+                        else:
+                            unknown_db.addMorph(m, count)
+                            line_unknown_morphs += 1
+                            if save_study_plan:
+                                source_unknown_db.addMorph(m, count)
+
+                        if morph_state & 4:
+                            mature_count += count
+                    
+                    if process_lines:
+                        line_morphs.append(line_morphs_set)
+                        line_count += 1
+                        if line_unknown_morphs == 0:
+                            known_line_count += 1
+                        elif line_unknown_morphs == 1:
+                            iplus1_line_count += 1
+
+            known_percent = 0.0 if len(seen_morphs.keys()) == 0 else 100.0 * len(known_morphs) / len(seen_morphs.keys())
+            readability = 0.0 if i_count == 0 else 100.0 * known_count / i_count
+            mature_percent = 0.0 if i_count == 0 else 100.0 * mature_count / i_count
+            learning_percent = readability - mature_percent
+            proper_noun_percent = 0.0 if i_count == 0 else 100.0 * proper_noun_count / i_count
+            line_percent = 0.0 if line_count == 0 else 100.0 * known_line_count / line_count
+            iplus1_percent = 0.0 if line_count == 0 else 100.0 * iplus1_line_count / line_count
+
+            log_text = '%s\t%d\t%d\t%0.2f\t%d\t%d\t%0.2f\t%0.2f\t%0.2f\t%0.2f\t%0.2f\t%0.2f\n' % (
+                        full_name, len(seen_morphs), len(known_morphs), known_percent, i_count, known_count,
+                        learning_percent, mature_percent, readability, proper_noun_percent, line_percent, iplus1_percent)
+            log_fp.write(log_text)
+            self.writeOutput(log_text)
+            row = self.ui.readabilityTable.rowCount()
+            self.ui.readabilityTable.insertRow(row)
+            self.ui.readabilityTable.setItem(row, 0, NaturalKeysTableWidgetItem(full_name))
+            self.ui.readabilityTable.setItem(row, 1, TableInteger(len(seen_morphs)))
+            self.ui.readabilityTable.setItem(row, 2, TableInteger(len(known_morphs)))
+            self.ui.readabilityTable.setItem(row, 3, TablePercent(known_percent))
+            self.ui.readabilityTable.setItem(row, 4, TableInteger(i_count))
+            self.ui.readabilityTable.setItem(row, 5, TableInteger(known_count))
+            self.ui.readabilityTable.setItem(row, 6, TablePercent(learning_percent))
+            self.ui.readabilityTable.setItem(row, 7, TablePercent(mature_percent))
+            self.ui.readabilityTable.setItem(row, 8, TablePercent(readability))
+            self.ui.readabilityTable.setItem(row, 9, TablePercent(proper_noun_percent))
+            self.ui.readabilityTable.setItem(row, 10, TablePercent(line_percent))
+            self.ui.readabilityTable.setItem(row, 11, TablePercent(iplus1_percent))
+
+            # save a local word report
+            #tmp_name = os.path.normpath(word_reports_path + '/' + source.name.replace('/', '_') + '.words')
+            #self.writeOutput("save report to '%s'\n" % tmp_name)
+            #self.saveWordReport(known_db, seen_morphs, tmp_name)
+
+            if save_study_plan:
+                source = Source(full_name, seen_morphs, line_morphs, source_unknown_db)
+                sources.append(source)
+
+        def measure_readability(file_path, corp_name):
+            def proc_lines(loc_corpus, text, is_ass, is_srt):
                 text_index = -1
                 num_fields = 1
                 srt_count = 0
 
-                def parse_text(text):
-                    nonlocal i_count, known_count, seen_morphs, known_morphs, all_morphs
-                    nonlocal proper_noun_count, line_count, known_line_count, iplus1_line_count, line_morphs
-
-                    log_fp.write('=== parse_text ===\n' + text + '\n')
-
+                def parse_text(loc_corpus, text):
                     parsed_morphs = getMorphemes(morphemizer, stripHTML(text))
                     if len(parsed_morphs) == 0:
                         return
 
-                    unknown_count = 0
-                    line_missing_morphs = set()
-                    for m in parsed_morphs:
-                        # Count morph for word report
-                        all_morphs[m] = all_morphs.get(m, 0) + 1
-                        seen_morphs[m] = seen_morphs.get(m, 0) + 1
-
-                        if m.isProperNoun():
-                            proper_noun_count += 1
-                            is_proper_noun = True
-                        else:
-                            is_proper_noun = False
-
-                        i_count += 1
-                        if known_db.matches(m) or is_proper_noun: # Proper nouns are easy to learn, so assume they're known.:
-                            known_morphs[m] = known_morphs.get(m, 0) + 1
-                            known_count += 1
-                        else:
-                            unknown_db.addMorph(m, 1)
-                            source_unknown_db.addMorph(m, 1)
-                            line_missing_morphs.add(m)
-                            unknown_count += 1
-                    line_count += 1
-                    if unknown_count == 0:
-                        known_line_count += 1
-                    elif unknown_count == 1:
-                        iplus1_line_count += 1
-                    line_morphs.append(line_missing_morphs)
+                    loc_corpus.add_line_morphs([m.deinflected() for m in parsed_morphs])
 
                 filtered_text = ''
-                for t in text.splitlines():
+                for id, t in enumerate(text.splitlines()):
                     should_flush = True
                     if is_ass:
                         if 'Format:' in t:
@@ -338,50 +588,42 @@ class MorphMan(QDialog):
                     
                     # Todo: This will flush every line so we can compute per-line readability, which is slower than batching lines.
                     #       Figure out how to get per-line analysis with batched lines.
-                    if should_flush:
+                    if should_flush or len(filtered_text) >= 2048:
                     #if len(filtered_text) >= 2048:
-                        parse_text(filtered_text)
+                        parse_text(loc_corpus, filtered_text)
                         filtered_text = ''
 
-                parse_text(filtered_text)
+                if len(filtered_text) > 0:
+                    parse_text(loc_corpus, filtered_text)
 
             try:
-                with open(file_name.strip(), 'rt', encoding='utf-8') as f:
-                    input = f.read()
-                    input = input.replace(u'\ufeff', '')
-                    #input = [l.replace(u'\ufeff', '') for l in f.read()]
-                    proc_lines(input, is_ass, is_srt)
-                    source = Source(file_name, seen_morphs, line_morphs, source_unknown_db)
-                    known_percent = 0.0 if len(seen_morphs.keys()) == 0 else 100.0 * len(known_morphs) / len(seen_morphs.keys())
-                    readability = 0.0 if i_count == 0 else 100.0 * known_count / i_count
-                    proper_noun_percent = 0.0 if line_count == 0 else 100.0 * proper_noun_count / i_count
-                    line_percent = 0.0 if line_count == 0 else 100.0 * known_line_count / line_count
-                    iplus1_percent = 0.0 if line_count == 0 else 100.0 * iplus1_line_count / line_count
+                file_path = file_path.strip()
+                file_basename = os.path.basename(file_path)
 
-                    self.writeOutput('%s\t%d\t%d\t%0.2f\t%d\t%d\t%0.2f\t%0.2f\t%0.2f\t%0.2f\n' % (
-                        source.name, len(seen_morphs), len(known_morphs), known_percent, i_count, known_count,
-                        readability, proper_noun_percent, line_percent, iplus1_percent))
-                    row = self.ui.readabilityTable.rowCount()
-                    self.ui.readabilityTable.insertRow(row)
-                    self.ui.readabilityTable.setItem(row, 0, QTableWidgetItem(source.name))
-                    self.ui.readabilityTable.setItem(row, 1, TableInteger(len(seen_morphs)))
-                    self.ui.readabilityTable.setItem(row, 2, TableInteger(len(known_morphs)))
-                    self.ui.readabilityTable.setItem(row, 3, TablePercent(known_percent))
-                    self.ui.readabilityTable.setItem(row, 4, TableInteger(i_count))
-                    self.ui.readabilityTable.setItem(row, 5, TableInteger(known_count))
-                    self.ui.readabilityTable.setItem(row, 6, TablePercent(readability))
-                    self.ui.readabilityTable.setItem(row, 7, TablePercent(proper_noun_percent))
-                    self.ui.readabilityTable.setItem(row, 8, TablePercent(line_percent))
-                    self.ui.readabilityTable.setItem(row, 9, TablePercent(iplus1_percent))
+                locs_before_load = len(corpus_db.ordered_locs)
 
-                    if save_study_plan:
-                        sources.append(source)
+                is_corpusdb = os.path.splitext(file_basename)[1].lower() == '.corpusdb'
+
+                if is_corpusdb:
+                    corpus_db.load(file_path, process_lines)
+                else:
+                    is_ass = os.path.splitext(file_basename)[1].lower() == '.ass'
+                    is_srt = os.path.splitext(file_basename)[1].lower() == '.srt'
+
+                    loc_name = (corp_name, 'text')
+                    loc_corpus = corpus_db.get_or_create_corpus(loc_name, process_lines)
+
+                    with open(file_path, 'rt', encoding='utf-8') as f:
+                        input = f.read()
+                        input = input.replace(u'\ufeff', '')
+                        proc_lines(loc_corpus, input, is_ass, is_srt)
+
             except:
-                self.writeOutput("Failed to process '%s'\n" % file_name)
+                self.writeOutput("Failed to process '%s'\n" % file_path)
                 raise
 
         def accepted_filetype(filename):
-            return filename.lower().endswith(('.srt', '.ass', '.txt'))
+            return filename.lower().endswith(('.srt', '.ass', '.txt', '.corpusdb'))
 
         list_of_files = list()
         for (dirpath, _, filenames) in os.walk(input_path):
@@ -389,50 +631,99 @@ class MorphMan(QDialog):
 
         self.ui.readabilityTable.clear()
         self.ui.readabilityTable.setRowCount(0)
-        self.ui.readabilityTable.setColumnCount(10)
+        self.ui.readabilityTable.setSortingEnabled(False)
+        self.ui.readabilityTable.setColumnCount(12)
         self.ui.readabilityTable.setHorizontalHeaderLabels([
             "Input", "Total\nMorphs", "Known\nMorphs", "Known\nMorphs %", "Total\nInstances", "Known\nInstances",
-            "Morph\nReadability %", "Proper\nNoun %", "Line\nReadability %", "i+1\nLines %"])
+            "Young\nInstances %", "Mature\nInstances %", "Known\nInstances %", "Proper\nNoun %", "Line\nReadability %", "i+1\nLines %"])
 
         if len(list_of_files) > 0:
-            self.writeOutput('%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' % (
+            self.writeOutput('%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' % (
                 "Input", "Total Morphs", "Known Morphs", "% Known Morphs", "Total Instances", "Known Instances",
-                "% Readability", "% Proper Nouns", "% Known Lines", "% i+1 Lines"))
+                "% Young", "% Mature", "% Known", "% Proper Nouns", "% Known Lines", "% i+1 Lines"))
 
             mw.progress.start( label='Measuring readability', max=len(list_of_files), immediate=True )
             for n, file_path in enumerate(sorted(list_of_files, key=natural_keys)):
                 mw.progress.update(value=n, label='Parsing (%d/%d) %s' % (
                     n + 1, len(list_of_files), os.path.basename(file_path)))
                 if os.path.isfile(file_path):
-                    is_ass = os.path.splitext(file_path)[1].lower() == '.ass'
-                    is_srt = os.path.splitext(file_path)[1].lower() == '.srt'
-                    measure_readability(file_path, is_ass, is_srt)
+                    corp_name = os.path.relpath(file_path, Path(input_path).parent)
+                    measure_readability(file_path, corp_name)
+
+            def get_loc_str(loc):
+                return loc[1] + ' : ' + (os.path.dirname(loc[0]) if group_by_dir else loc[0])
+
+            total_locs = len(corpus_db.ordered_locs)
+            i = 0
+            while i < total_locs:
+                i_loc_str = get_loc_str(corpus_db.ordered_locs[i][0])
+                j = i + 1
+
+                mw.progress.update(value=i, label='Updating (%d/%d) %s' % (
+                    i + 1, total_locs, i_loc_str))
+                
+                while j < total_locs:
+                    j_loc = corpus_db.ordered_locs[j]
+                    if i_loc_str != get_loc_str(corpus_db.ordered_locs[j][0]):
+                        break
+                    j = j + 1
+
+                proc_file_result(i_loc_str, [x[1] for x in corpus_db.ordered_locs[i:j]])
+                i = j
+            
+            #total_locs = len(corpus_db.ordered_locs)
+            #for i, (loc, loc_corpus) in enumerate(corpus_db.ordered_locs):
+            #    mw.progress.update(value=n, label='Updating (%d/%d) %s' % (
+            #        i + 1, total_locs, str(loc[0])))
+            #    proc_file_result(loc, loc_corpus)
+
+            self.writeOutput('\nUsed morphemizer: %s\n' % morphemizer.getDescription())
             mw.progress.finish()
         else:
             self.writeOutput('\nNo files found to process.\n')
             return
 
-        self.ui.readabilityTable.resizeColumnsToContents()
+        self.ui.readabilityTable.setSortingEnabled(True)
+        self.ui.readabilityTable.resizeColumnsToContents()       
 
         if save_word_report:
-            self.writeOutput("\n[Saving word report to '%s'...]\n" % word_report_path)
-            with open(word_report_path, 'wt', encoding='utf-8') as f:
+            self.writeOutput("\n[Saving word instance report to '%s'...]\n" % instance_freq_report_path)
+            self.saveWordReport(known_db, all_morph_instances, instance_freq_report_path)
+
+            self.writeOutput("\n[Saving unique morph word report to '%s'...]\n" % morph_freq_report_path)
+            self.saveWordReport(known_db, all_morphs, morph_freq_report_path)
+
+        if save_missing_word_report:
+            self.writeOutput("\n[Saving missing word report to '%s'...]\n" % missing_master_path)
+        
+            master_morphs = {}
+            for ms in master_db.db.values():
+                for m, c in ms.items():
+                    if known_db.matches(m) or (proper_nouns_known and m.isProperNoun()):
+                        continue
+                    master_morphs[m] = c[0]
+
+            with open(missing_master_path, 'wt', encoding='utf-8') as f:
                 last_count = 0
                 morph_idx = 0
                 group_idx = 0
                 morph_total = 0.0
-                all_morphs_count = sum(n for n in all_morphs.values())
+                master_morphs_count = sum(n for n in master_morphs.values())
 
-                for m in sorted(all_morphs.items(), key=operator.itemgetter(1), reverse=True):
+                for m in sorted(master_morphs.items(), key=operator.itemgetter(1), reverse=True):
                     if m[1] != last_count:
                         last_count = m[1]
                         group_idx += 1
                     morph_idx += 1
-                    morph_delta = 100.0 * m[1] / all_morphs_count
+                    morph_delta = 100.0 * m[1] / master_morphs_count
                     morph_total += morph_delta
                     print('%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%0.8f\t%0.8f matches %d' % (
                         m[1], m[0].norm, m[0].base, m[0].read, m[0].pos, m[0].subPos, group_idx, morph_idx, morph_delta,
                         morph_total, known_db.matches(m[0])), file=f)
+
+        if save_readability_db:
+            self.writeOutput("\n[Saving corpus database to '%s'...]\n" % corpus_db_path)
+            corpus_db.save(corpus_db_path)
 
         learned_tot = 0
         learned_morphs = []
@@ -444,7 +735,7 @@ class MorphMan(QDialog):
             for line_morphs in show.line_morphs:
                 has_unknowns = False
                 for m in line_morphs:
-                    if known_db.matches(m):
+                    if known_db.matches(m) or (proper_nouns_known and m.isProperNoun()):
                         continue
                     has_unknowns = True
                 if not has_unknowns:
@@ -457,6 +748,7 @@ class MorphMan(QDialog):
             with open(study_plan_path, 'wt', encoding='utf-8') as f:
                 self.ui.studyPlanTable.clear()
                 self.ui.studyPlanTable.setRowCount(0)
+                self.ui.studyPlanTable.setSortingEnabled(False)
                 self.ui.studyPlanTable.setColumnCount(7)
                 self.ui.studyPlanTable.setHorizontalHeaderLabels([
                     "Input", "To Study\nMorphs ", "Cummulative\nMorphs", "Old Morph\nReadability %", "New Morph\nReadability %",
@@ -465,7 +757,7 @@ class MorphMan(QDialog):
                 mw.progress.start( label='Building study plan', max=len(sources), immediate=True )
 
                 for n, s in enumerate(sources):
-                    mw.progress.update( value=n, label='Processing (%d/%d) %s' % (n+1, len(sources), os.path.basename(s.name)) )
+                    mw.progress.update( value=n, label='Processing (%d/%d) %s' % (n+1, len(sources), s.name) )
                     if debug_output: f.write('Processing %s\n' % s.name)
 
                     known_i = 0
@@ -527,7 +819,7 @@ class MorphMan(QDialog):
 
                     row = self.ui.studyPlanTable.rowCount()
                     self.ui.studyPlanTable.insertRow(row)
-                    self.ui.studyPlanTable.setItem(row, 0, QTableWidgetItem(s.name))
+                    self.ui.studyPlanTable.setItem(row, 0, NaturalKeysTableWidgetItem(s.name))
                     self.ui.studyPlanTable.setItem(row, 1, TableInteger(learned_m))
                     self.ui.studyPlanTable.setItem(row, 2, TableInteger(learned_tot))
                     self.ui.studyPlanTable.setItem(row, 3, TablePercent(old_readability))
@@ -538,35 +830,38 @@ class MorphMan(QDialog):
                     for m in learned_this_source:
                         f.write('\t' + m[0].show() + '\t[score %d ep_freq %d all_freq %d master_freq %d]\n' % (m[5], m[2], m[3], m[4]))
 
+                self.ui.studyPlanTable.setSortingEnabled(True)
                 self.ui.studyPlanTable.resizeColumnsToContents()
                 mw.progress.finish()
 
                 if save_frequency_list:
                     self.writeOutput("\n[Saving frequency list to '%s'...]\n" % frequency_list_path)
                     with open(frequency_list_path, 'wt', encoding='utf-8') as f:
+                        f.write("#study_plan_frequency\t1.0\n")
+
                         unique_set = set()
                         # First output morphs according to the plan.
                         for m in learned_morphs:
-                            if m[0].base in unique_set:
+                            if m[0] in unique_set:
                                 continue
-                            unique_set.add(m[0].base)
-                            print(m[0].base + '\t[score %d ep_freq %d all_freq %d master_freq %d]' % (m[5], m[2], m[3], m[4]), file=f)
+                            unique_set.add(m[0])
+                            print(m[0].show() + '\t[score %d ep_freq %d all_freq %d master_freq %d]' % (m[5], m[2], m[3], m[4]), file=f)
                         
                         # Followed by all remaining morphs sorted by score.
                         if fill_all_morphs_in_plan:
                             for m in sorted(all_missing_morphs, key=operator.itemgetter(5), reverse=True):
-                                if (m[0].base in unique_set):
+                                if (m[0] in unique_set):
                                     continue
                                 if m[4] < minimum_master_frequency:
                                     continue
-                                unique_set.add(m[0].base)
-                                print(m[0].base + '\t[score %d ep_freq %d all_freq %d master_freq %d]' % (m[5], m[2], m[3], m[4]), file=f)
+                                unique_set.add(m[0])
+                                print(m[0].show() + '\t[score %d ep_freq %d all_freq %d master_freq %d]' % (m[5], m[2], m[3], m[4]), file=f)
                 
                 if master_total_instances > 0:
                     master_score = 0
                     for ms in master_db.db.values():
                         for m, c in ms.items():
-                            if known_db.matches(m):
+                            if known_db.matches(m) or (proper_nouns_known and m.isProperNoun()):
                                 master_score += c[0]
                                 c[1] = True  # mark matched
                     self.writeOutput("\n[New master frequency readability] %0.02f -> %0.02f\n" % (

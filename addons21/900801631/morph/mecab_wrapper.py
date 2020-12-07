@@ -17,6 +17,8 @@ from .util_external import memoize
 MECAB_NODE_UNIDIC_BOS = 'BOS/EOS,*,*,*,*,*,*,*,*,*,*,*,*,*'
 MECAB_NODE_UNIDIC_PARTS = ['%f[7]', '%f[12]', '%m', '%f[6]', '%f[0]', '%f[1]']
 MECAB_NODE_LENGTH_UNIDIC = len(MECAB_NODE_UNIDIC_PARTS)
+MECAB_NODE_UNIDIC_22_BOS = 'BOS/EOS,*,*,*,*,*,*,*,*,*,*,*,*,*,*,*,*'
+MECAB_NODE_UNIDIC_22_PARTS = ['%f[7]', '%f[10]', '%m', '%f[6]', '%f[0]', '%f[1]']
 MECAB_NODE_IPADIC_BOS = 'BOS/EOS,*,*,*,*,*,*,*,*'
 MECAB_NODE_IPADIC_PARTS = ['%f[6]', '%m', '%f[7]', '%f[0]', '%f[1]']
 MECAB_NODE_LENGTH_IPADIC = len(MECAB_NODE_IPADIC_PARTS)
@@ -35,13 +37,22 @@ MECAB_SUBPOS_BLACKLIST = [
 is_unidic = True
 
 kanji = r'[㐀-䶵一-鿋豈-頻]'
+wide_alpha_num_rx = re.compile(r'[０-９Ａ-Ｚａ-ｚ]')
 
+mecab_source = ""
 
 def extract_unicode_block(unicode_block, string):
     """ extracts and returns all texts from a unicode block from string argument.
         Note that you must use the unicode blocks defined above, or patterns of similar form """
     return re.findall(unicode_block, string)
 
+
+def getMecabIdentity():
+    # Initialize mecab before we get the identity
+    m = mecab()
+
+    # identify the mecab being used
+    return mecab_source
 
 def getMorpheme(parts):
     global is_unidic
@@ -53,7 +64,12 @@ def getMorpheme(parts):
         pos = parts[4] if parts[4] != '' else '*'
         subPos = parts[5] if parts[5] != '' else '*'
 
+        # Drop blacklisted parts of speech
         if (pos in MECAB_POS_BLACKLIST) or (subPos in MECAB_SUBPOS_BLACKLIST):
+            return None
+
+        # Drop wide alpha-numeric morphemes
+        if wide_alpha_num_rx.search(parts[1]):
             return None
 
         norm = parts[0]
@@ -111,6 +127,9 @@ def spawnMecab(base_cmd, startupinfo):
     if bos_feature_match is not None and bos_feature_match.group(1).strip() == MECAB_NODE_UNIDIC_BOS:
         node_parts = MECAB_NODE_UNIDIC_PARTS
         is_unidic = True
+    elif bos_feature_match is not None and bos_feature_match.group(1).strip() == MECAB_NODE_UNIDIC_22_BOS:
+        node_parts = MECAB_NODE_UNIDIC_22_PARTS
+        is_unidic = True
     elif bos_feature_match is not None and bos_feature_match.group(1).strip() == MECAB_NODE_IPADIC_BOS:
         node_parts = MECAB_NODE_IPADIC_PARTS
         is_unidic = False
@@ -142,6 +161,8 @@ def mecab():  # IO MecabProc
     instance is needed.  That's why this function is memoized.
     """
 
+    global mecab_source # make it global so we can query it later
+
     if sys.platform.startswith('win'):
         si = subprocess.STARTUPINFO()
         try:
@@ -156,10 +177,17 @@ def mecab():  # IO MecabProc
     reading = None
 
     # 1st priority - MecabUnidic
+    if importlib.util.find_spec('MecabUnidic'):
+        try:
+            reading = importlib.import_module('MecabUnidic.reading')
+            mecab_source = 'MecabUnidic from addon MecabUnidic'
+        except ModuleNotFoundError:
+            pass
+    
     if importlib.util.find_spec('13462835'):
         try:
             reading = importlib.import_module('13462835.reading')
-            mecab_source = 'MecabUnidic'
+            mecab_source = 'MecabUnidic from addon 13462835'
         except ModuleNotFoundError:
             pass
 
@@ -167,7 +195,7 @@ def mecab():  # IO MecabProc
     if (not reading) and importlib.util.find_spec('3918629684'):
         try:
             reading = importlib.import_module('3918629684.reading')
-            mecab_source = 'Japanese Support'
+            mecab_source = 'Japanese Support from addon 3918629684'
         except ModuleNotFoundError:
             pass
 
@@ -175,14 +203,14 @@ def mecab():  # IO MecabProc
     if (not reading) and importlib.util.find_spec('MIAJapaneseSupport'):
         try:
             reading = importlib.import_module('MIAJapaneseSupport.reading')
-            mecab_source = 'MIAJapaneseSupport'
+            mecab_source = 'MIAJapaneseSupport from addon MIAJapaneseSupport'
         except ModuleNotFoundError:
             pass
-    # 4nd priority - MIAJapaneseSupport via Anki code (278530045)
+    # 4nd priority - MigakuJapaneseSupport via Anki code (278530045)
     if (not reading) and importlib.util.find_spec('278530045'):
         try:
             reading = importlib.import_module('278530045.reading')
-            mecab_source = '278530045'
+            mecab_source = 'Migaku Japanese support from addon 278530045'
         except ModuleNotFoundError:
             pass
 
@@ -198,17 +226,18 @@ def mecab():  # IO MecabProc
     if not reading:
         try:
             return spawnMecab(['mecab'], si), 'System'
-        except:
+        except Exception as e:
             raise OSError('''
             Mecab Japanese analyzer could not be found.
             Please install one of the following Anki add-ons:
                  https://ankiweb.net/shared/info/3918629684
                  https://ankiweb.net/shared/info/13462835
-                 https://ankiweb.net/shared/info/278530045''')
+                 https://ankiweb.net/shared/info/278530045''') from e
 
     m = reading.MecabController()
     m.setup()
     # m.mecabCmd[1:4] are assumed to be the format arguments.
+    print('Using morphman: [%s] with command line [%s]' % (mecab_source, m.mecabCmd))
 
     return spawnMecab(m.mecabCmd[:1] + m.mecabCmd[4:], si), mecab_source
 
